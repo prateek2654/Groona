@@ -1,0 +1,1396 @@
+const express = require('express');
+const router = express.Router();
+const mongoose = require('mongoose');
+const Models = require('../models/SchemaDefinitions');
+
+// === CURRENCY CONVERSION ENDPOINT ===
+router.get('/currency/convert', async (req, res) => {
+  const { from, to, amount } = req.query;
+
+  if (!from || !to) {
+    return res.status(400).json({ error: 'Missing "from" or "to" currency parameters' });
+  }
+
+  const sourceUpper = from.toUpperCase();
+  const targetUpper = to.toUpperCase();
+  const amountVal = parseFloat(amount) || 1;
+
+  if (sourceUpper === targetUpper) {
+    return res.json({
+      from: sourceUpper,
+      to: targetUpper,
+      rate: 1,
+      result: amountVal,
+      fetched_at: new Date(),
+      source: 'identity'
+    });
+  }
+
+  try {
+    const ExchangeRate = Models.ExchangeRate;
+    if (!ExchangeRate) {
+      throw new Error("ExchangeRate model not registered");
+    }
+
+    // --- REFINEMENT: BULK CACHE & CROSS-RATE LOGIC ---
+    // Fixer.io Free Tier provides rates relative to EUR.
+    // Strategy: Ensure we have fresh "EUR -> *" rates in DB.
+
+    // 1. Check if we have a fresh 'EUR' -> 'USD' (as a proxy for "cache is warm")
+    // We check just one common pair to decide if we need to refresh ALL.
+    const sentinelRate = await ExchangeRate.findOne({
+      from_currency: 'EUR',
+      to_currency: 'USD'
+    });
+
+    const now = new Date();
+    const isCacheFresh = sentinelRate && ((now - new Date(sentinelRate.fetched_at)) < 24 * 60 * 60 * 1000);
+
+    if (!isCacheFresh) {
+      // 2. Refresh Cache (Fetch ALL from Fixer)
+      console.log("[Currency] Cache stale or missing. Fetching fresh rates from Fixer.io...");
+      const fixerUrl = process.env.RATE;
+
+      if (!fixerUrl) {
+        console.error("Missing RATE env var for Fixer.io");
+        return res.status(500).json({ error: "Currency service configuration missing" });
+      }
+
+      const response = await axios.get(fixerUrl);
+
+      if (response.data.success && response.data.rates) {
+        const rates = response.data.rates; // Base is EUR
+        const fetchedAt = new Date();
+        const bulkOps = [];
+
+        // Prepare bulk upserts
+        Object.entries(rates).forEach(([currency, rate]) => {
+          bulkOps.push({
+            updateOne: {
+              filter: { from_currency: 'EUR', to_currency: currency },
+              update: {
+                $set: {
+                  rate: rate,
+                  fetched_at: fetchedAt,
+                  provider: 'fixer.io'
+                }
+              },
+              upsert: true
+            }
+          });
+        });
+
+        // Also ensure EUR->EUR is 1 (sometimes not in list)
+        bulkOps.push({
+          updateOne: {
+            filter: { from_currency: 'EUR', to_currency: 'EUR' },
+            update: { $set: { rate: 1, fetched_at: fetchedAt, provider: 'fixer.io' } },
+            upsert: true
+          }
+        });
+
+        if (bulkOps.length > 0) {
+          await ExchangeRate.bulkWrite(bulkOps);
+          console.log(`[Currency] Cached ${bulkOps.length} rates.`);
+        }
+      } else {
+        console.error("Fixer.io Error:", response.data.error);
+        if (!sentinelRate) {
+          return res.status(502).json({ error: "Failed to fetch exchange rates" });
+        }
+        console.warn("[Currency] Using stale cache due to API failure.");
+      }
+    }
+
+    // 3. Perform Conversion using DB Data (Cross-Rate)
+    // We need EUR->Source and EUR->Target
+    // If Source is EUR, rate is 1. If Target is EUR, rate is 1.
+    // However, since we stored EUR->EUR above or we can query it, let's just query efficiently.
+
+    const rates = await ExchangeRate.find({
+      from_currency: 'EUR',
+      to_currency: { $in: [sourceUpper, targetUpper] }
+    });
+
+    const sourceRateDoc = rates.find(r => r.to_currency === sourceUpper);
+    const targetRateDoc = rates.find(r => r.to_currency === targetUpper);
+
+    if (!sourceRateDoc || !targetRateDoc) {
+      return res.status(400).json({ error: `Rates for ${sourceUpper} or ${targetUpper} not available.` });
+    }
+
+    // Cross-Rate Formula:
+    // Source -> Target = (EUR -> Target) / (EUR -> Source)
+    const rateSource = sourceRateDoc.rate;
+    const rateTarget = targetRateDoc.rate;
+
+    const finalRate = rateTarget / rateSource;
+
+    res.json({
+      from: sourceUpper,
+      to: targetUpper,
+      rate: finalRate,
+      result: amountVal * finalRate,
+      fetched_at: sourceRateDoc.fetched_at, // Use timestamp of data source
+      source: isCacheFresh ? 'cache' : 'api-refreshed'
+    });
+
+  } catch (error) {
+    console.error("Currency conversion error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+// nodemailer removed - using Resend SDK now
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+const WebSocket = require('ws');
+const modelHelper = require('../helpers/geminiModelHelper');
+const emailService = require('../services/emailService');
+
+// --- CONFIGURATION ---
+// Use helper to get default model (gemini-2.5-flash-native-audio-dialog)
+const DEFAULT_MODEL = modelHelper.getDefaultModel();
+
+// --- HELPER: FILE PROCESSING ---
+function findFileLocally(filename) { const cleanName = path.basename(filename); const possiblePaths = [path.join(__dirname, '..', 'uploads', cleanName), path.join(process.cwd(), 'uploads', cleanName), path.join(process.cwd(), 'public', 'uploads', cleanName), path.join(__dirname, 'uploads', cleanName), path.join('/tmp', cleanName)]; for (const p of possiblePaths) { if (fs.existsSync(p)) return p; } return null; }
+function getFileHandler(filePath) { const ext = path.extname(filePath).toLowerCase(); const mediaTypes = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.pdf': 'application/pdf', '.heic': 'image/heic', '.heif': 'image/heif' }; const textTypes = ['.txt', '.md', '.csv', '.json', '.js', '.jsx', '.ts', '.tsx', '.html', '.css', '.scss', '.py', '.java', '.c', '.cpp', '.h', '.hpp', '.cs', '.go', '.rb', '.php', '.swift', '.kt', '.sql', '.sh', '.bat', '.ps1', '.env', '.xml', '.yaml', '.yml', '.ini', '.log', '.conf']; if (mediaTypes[ext]) return { type: 'media', mimeType: mediaTypes[ext] }; if (textTypes.includes(ext)) return { type: 'text' }; return { type: 'unsupported' }; }
+async function processFilesForGemini(fileUrls, req) { const parts = []; if (!fileUrls || !Array.isArray(fileUrls) || fileUrls.length === 0) return parts; for (const url of fileUrls) { try { const cleanUrl = decodeURIComponent(url); const filename = cleanUrl.split('/').pop(); const handler = getFileHandler(filename); if (handler.type === 'unsupported') continue; let processed = false; const localPath = findFileLocally(filename); if (localPath) { try { if (handler.type === 'text') { const textContent = fs.readFileSync(localPath, 'utf8'); parts.push({ text: `\n\n--- FILE START: ${filename} ---\n${textContent}\n--- FILE END ---\n` }); processed = true; } else if (handler.type === 'media') { const fileBuffer = fs.readFileSync(localPath); parts.push({ inlineData: { data: fileBuffer.toString('base64'), mimeType: handler.mimeType } }); processed = true; } } catch (e) { console.error("Local file read error:", e); } } if (!processed) { let downloadUrl = url; if (url.startsWith('/')) { const protocol = req.protocol || 'http'; const host = req.get('host'); downloadUrl = `${protocol}://${host}${url}`; } const response = await axios.get(downloadUrl, { responseType: 'arraybuffer' }); if (handler.type === 'text') { const textContent = Buffer.from(response.data).toString('utf8'); parts.push({ text: `\n\n--- FILE START: ${filename} ---\n${textContent}\n--- FILE END ---\n` }); } else { parts.push({ inlineData: { data: Buffer.from(response.data).toString('base64'), mimeType: response.headers['content-type'] || handler.mimeType } }); } } } catch (fileError) { console.error("Attachment Error:", fileError.message); } } return parts; }
+
+// --- CASCADE DELETE HELPER ---
+async function handleCascadeDelete(entity, id) {
+  try {
+    if (entity === 'Project') {
+      const filter = { project_id: id };
+      await Models.Task.deleteMany(filter);
+      await Models.Story.deleteMany(filter);
+      await Models.Sprint.deleteMany(filter);
+      await Models.Epic.deleteMany(filter);
+      await Models.Activity.deleteMany(filter);
+      await Models.Milestone.deleteMany(filter);
+      await Models.ProjectExpense.deleteMany(filter);
+      await Models.ProjectFile.deleteMany(filter);
+      await Models.ProjectClient.deleteMany(filter);
+      await Models.ProjectReport.deleteMany(filter);
+      await Models.Timesheet.deleteMany(filter);
+      await Models.ProjectUserRole.deleteMany(filter);
+      await Models.Impediment.deleteMany(filter);
+      await Models.Comment.deleteMany({ entity_type: 'project', entity_id: id });
+    } else if (entity === 'Epic') {
+      const stories = await Models.Story.find({ epic_id: id });
+      for (const story of stories) {
+        await Models.Task.deleteMany({ story_id: story._id });
+        await Models.Story.findByIdAndDelete(story._id);
+        await Models.Impediment.deleteMany({ story_id: story._id });
+        await Models.Comment.deleteMany({ entity_type: 'story', entity_id: story._id });
+      }
+      await Models.Impediment.deleteMany({ epic_id: id });
+    } else if (entity === 'Story') {
+      await Models.Task.deleteMany({ story_id: id });
+      await Models.Impediment.deleteMany({ story_id: id });
+      await Models.Comment.deleteMany({ entity_type: 'story', entity_id: id });
+    } else if (entity === 'Sprint') {
+      await Models.Task.deleteMany({ sprint_id: id });
+      await Models.Impediment.deleteMany({ sprint_id: id });
+    } else if (entity === 'Task') {
+      await Models.Comment.deleteMany({ entity_type: 'task', entity_id: id });
+      await Models.Impediment.deleteMany({ task_id: id });
+    }
+  } catch (err) {
+    console.error(`[CascadeDelete] Error cleaning up ${entity} ${id}:`, err);
+  }
+}
+
+// ==========================================
+// 1. WEBSOCKET WRAPPER (Live API)
+// ==========================================
+async function generateViaSocket(apiKey, model, fullPrompt) {
+  return new Promise((resolve, reject) => {
+    const host = "generativelanguage.googleapis.com";
+    let cleanModel = model;
+    if (model.includes('native-audio') || model.includes('live')) {
+      cleanModel = model.startsWith('models/') ? model : `models/${model}`;
+    }
+
+    // Use v1beta for native-audio-dialog models (required for gemini-2.5-flash-native-audio-dialog)
+    // v1alpha doesn't support this model
+    const apiVersion = model.includes('native-audio-dialog') ? 'v1beta' : 'v1alpha';
+    const url = `wss://${host}/ws/google.ai.generativelanguage.${apiVersion}.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+
+    console.log(`[Socket] Connecting to: ${url.split('?')[0]} (Model: ${cleanModel})`);
+
+    const ws = new WebSocket(url);
+
+    let responseText = "";
+    let hasResolved = false;
+
+    const timeout = setTimeout(() => {
+      if (!hasResolved) {
+        ws.terminate();
+        reject(new Error("Live API Timeout - No response in 30s"));
+      }
+    }, 30000);
+
+    ws.on('open', () => {
+      const setupMsg = {
+        setup: {
+          model: cleanModel,
+          generation_config: { response_modalities: ["TEXT"] }
+        }
+      };
+      ws.send(JSON.stringify(setupMsg));
+    });
+
+    ws.on('message', (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.setupComplete) {
+          const clientMsg = {
+            client_content: {
+              turns: [{ role: "user", parts: [{ text: fullPrompt }] }],
+              turn_complete: true
+            }
+          };
+          ws.send(JSON.stringify(clientMsg));
+          return;
+        }
+        if (msg.serverContent?.modelTurn?.parts) {
+          for (const part of msg.serverContent.modelTurn.parts) {
+            if (part.text) responseText += part.text;
+          }
+        }
+        if (msg.serverContent?.turnComplete) {
+          hasResolved = true;
+          clearTimeout(timeout);
+          ws.close();
+          resolve({ text: responseText, usedModel: cleanModel });
+        }
+      } catch (e) {
+        console.error("[Socket] Parse Error:", e.message);
+      }
+    });
+
+    ws.on('error', (err) => {
+      if (!hasResolved) {
+        clearTimeout(timeout);
+        reject(err);
+      }
+    });
+
+    ws.on('close', (code, reason) => {
+      if (!hasResolved) {
+        clearTimeout(timeout);
+        if (responseText.length > 0) resolve({ text: responseText, usedModel: cleanModel });
+        else reject(new Error(`Socket closed (Code: ${code}).`));
+      }
+    });
+  });
+}
+
+// ==========================================
+// 2. RETRY LOGIC (Standard HTTP Models)
+// ==========================================
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function generateStandardWithRetry(genAI, params, modelName) {
+  let cleanName = modelName.replace('models/', '');
+
+  if (cleanName.toLowerCase().startsWith('gemma') && !cleanName.includes('-it')) {
+    cleanName += '-it';
+  }
+
+  let modifiedContent = params.content;
+  let systemInstructionConfig = params.systemInstruction;
+
+  // [MODIFICATION] Handle Gemma System Instructions
+  if (cleanName.toLowerCase().includes('gemma') && params.systemInstruction) {
+    const sysText = params.systemInstruction.parts?.[0]?.text || "";
+    if (Array.isArray(modifiedContent)) {
+      modifiedContent = [{ text: `SYSTEM: ${sysText}\n\nUSER:` }, ...modifiedContent];
+    } else {
+      modifiedContent = `SYSTEM: ${sysText}\n\nUSER:\n${modifiedContent}`;
+    }
+    systemInstructionConfig = undefined;
+  }
+
+  // [MODIFICATION] Handle Gemma JSON Mode Incompatibility
+  // Gemma models do NOT support responseMimeType: "application/json"
+  let finalConfig = params.generationConfig ? { ...params.generationConfig } : {};
+  if (cleanName.toLowerCase().includes('gemma') && finalConfig.responseMimeType === 'application/json') {
+    console.warn(`[AI API] Disabling JSON mode for ${cleanName} (Not Supported)`);
+    delete finalConfig.responseMimeType;
+  }
+
+  const model = genAI.getGenerativeModel({
+    model: cleanName,
+    systemInstruction: systemInstructionConfig,
+    generationConfig: finalConfig
+  });
+
+  try {
+    const safetySettings = [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+    ];
+
+    let result;
+    if (params.history && !cleanName.includes('gemma')) {
+      const chat = model.startChat({ history: params.history, safetySettings });
+      result = await chat.sendMessage(modifiedContent);
+    } else {
+      const parts = Array.isArray(modifiedContent) ? modifiedContent : [{ text: modifiedContent }];
+      result = await model.generateContent({ contents: [{ role: 'user', parts: parts }], safetySettings });
+    }
+    return { text: result.response.text(), usage: result.response.usageMetadata, model: cleanName };
+
+  } catch (error) {
+    throw error;
+  }
+}
+
+// --- DYNAMIC CONTROLLER ---
+async function generateController(genAI, params, requestedModel, retryCount = 0) {
+  // Use helper to get model (always defaults to gemini-2.5-flash-native-audio-dialog)
+  let targetModel = modelHelper.getModel(requestedModel);
+  const modelConfig = modelHelper.createModelConfig(targetModel);
+
+  try {
+    console.log(`[AI API] Attempting: ${targetModel} (Try: ${retryCount + 1})`);
+
+    if (modelConfig.isLive) {
+      let fullPrompt = "";
+      if (params.systemInstruction?.parts?.[0]?.text) fullPrompt += `SYSTEM: ${params.systemInstruction.parts[0].text}\n`;
+      if (params.history) params.history.forEach(h => fullPrompt += `${h.role}: ${h.parts[0].text}\n`);
+      let currentText = Array.isArray(params.content) ? params.content.map(p => p.text).join('\n') : params.content;
+      fullPrompt += `User: ${currentText}`;
+
+      return await generateViaSocket(process.env.GEMINI_API_KEY, targetModel, fullPrompt);
+    } else {
+      return await generateStandardWithRetry(genAI, params, targetModel);
+    }
+
+  } catch (error) {
+    // Use helper to determine if we should fallback (only on technical errors, not quota)
+    const shouldTryFallback = modelHelper.shouldFallback(error, targetModel);
+    const fallbackModel = modelHelper.getFallbackModel(targetModel);
+
+    // Only fallback in rare cases (technical errors, not quota issues)
+    if (shouldTryFallback && fallbackModel && retryCount < 2) {
+      console.warn(`[AI API] Model ${targetModel} failed with technical error. Falling back to ${fallbackModel} (Retry: ${retryCount + 1})`);
+      return await generateController(genAI, params, fallbackModel, retryCount + 1);
+    }
+
+    throw new Error(`AI Generation Failed (${targetModel}): ${error.message}`);
+  }
+}
+
+// === UPDATED: CONTEXT LOADER WITH DUE DATES ===
+async function buildDeepContext(tenant_id, user_id, content) {
+  let contextStr = "";
+  if (!content) return contextStr;
+  const lowerQ = content.toLowerCase();
+  const needsDb = lowerQ.match(/task|project|assign|team|manager|status|due|ticket/);
+
+  if (needsDb) {
+    const currentUser = await Models.User.findById(user_id);
+    if (currentUser) contextStr += `CURRENT USER: ${currentUser.full_name}\n`;
+
+    const tasks = await Models.Task.find({ tenant_id }).sort({ due_date: 1 }).limit(50);
+
+    contextStr += `\n=== DATABASE: RELEVANT TASKS ===\n`;
+    contextStr += tasks.map(t => {
+      const dueStr = t.due_date ? new Date(t.due_date).toLocaleDateString() : 'No Due Date';
+      return `* Task: "${t.title}" | Status: ${t.status} | Priority: ${t.priority} | Due: ${dueStr}`;
+    }).join('\n');
+  }
+  return contextStr;
+}
+
+// ... (GENERIC ROUTES) ...
+router.post('/entities/:entity/filter', async (req, res) => { try { const Model = Models[req.params.entity]; if (!Model) return res.status(400).json({ msg: `Entity not found` }); const { filters = {}, sort } = req.body; let query = Model.find(filters); if (sort) { const sortObj = {}; if (sort.startsWith('-')) sortObj[sort.substring(1)] = -1; else sortObj[sort] = 1; query = query.sort(sortObj); } res.json(await query.exec()); } catch (err) { res.json([]); } });
+router.post('/entities/:entity/create', async (req, res) => {
+  try {
+    const Model = Models[req.params.entity];
+    const entityName = req.params.entity;
+
+    // --- ASSIGNMENT FREEZE VALIDATION ---
+    if (entityName === 'Task' && req.body.assigned_to) {
+      let assignees = [];
+      if (Array.isArray(req.body.assigned_to)) {
+        assignees = req.body.assigned_to;
+      } else if (typeof req.body.assigned_to === 'string') {
+        assignees = req.body.assigned_to.split(',').map(s => s.trim()).filter(Boolean);
+      }
+
+      if (assignees.length > 0) {
+        const Notification = Models.Notification;
+        const frozenUsers = [];
+        for (const email of assignees) {
+          if (!email) continue;
+          // Check for active high rework alarm (OPEN or APPEALED)
+          const alarm = await Notification.findOne({
+            recipient_email: email,
+            type: 'high_rework_alarm',
+            status: { $in: ['OPEN', 'APPEALED'] }
+          });
+          if (alarm) frozenUsers.push(email);
+        }
+
+        if (frozenUsers.length > 0) {
+          return res.status(400).json({
+            error: `Cannot assign task: User has too many rework tasks.`
+          });
+        }
+      }
+    }
+
+
+    // --- TIMESHEET VALIDATION: OVERWORK LOCK ---
+    if (entityName === 'Timesheet') {
+      if (req.body.work_type === 'overtime') {
+        const userEmail = req.body.user_email;
+        if (userEmail) {
+          const user = await Models.User.findOne({ email: userEmail });
+          if (user && user.is_overloaded) {
+            return res.status(400).json({
+              error: 'Overtime is disabled because you have exceeded the work limit (>11h for 5 consecutive days). Please contact your Project Manager.'
+            });
+          }
+        }
+      }
+    }
+
+    // --- TIMESHEET SPECIAL LOGIC: SNAPSHOT CTC ---
+    if (entityName === 'Timesheet') {
+      try {
+        const userEmail = req.body.user_email;
+        if (userEmail) {
+          const user = await Models.User.findOne({ email: userEmail });
+          if (user && user.hourly_rate) {
+            req.body.snapshot_hourly_rate = user.hourly_rate;
+            // Calculate total cost using total_minutes for accuracy
+            const totalMins = req.body.total_minutes || ((req.body.hours || 0) * 60 + (req.body.minutes || 0));
+            if (totalMins > 0) {
+              req.body.snapshot_total_cost = user.hourly_rate * (totalMins / 60);
+            }
+          }
+        }
+      } catch (tsError) {
+        console.error("Error creating Timesheet snapshot:", tsError);
+        // Continue creating timesheet even if snapshot fails
+      }
+    }
+
+    const item = new Model(req.body);
+    const savedItem = await item.save();
+
+    res.json(savedItem);
+
+    // --- ACTIVITY LOGGING ---
+    setImmediate(async () => {
+      try {
+        const { logUserMetrics } = require('../utils/userMetricsLogger');
+
+        // 1. Timesheet Created -> Log for User
+        if (entityName === 'Timesheet') {
+          await logUserMetrics(savedItem.user_email, 'timesheet_submission');
+        }
+
+        // 2. Task Created/Assigned -> Log for Assignees
+        if (entityName === 'Task' && savedItem.assigned_to) {
+          const assignees = Array.isArray(savedItem.assigned_to) ? savedItem.assigned_to : [savedItem.assigned_to];
+          for (const email of assignees) {
+            await logUserMetrics(email, 'task_assignment');
+          }
+        }
+      } catch (err) {
+        console.error("Activity Logging Error:", err);
+      }
+    });
+
+    // --- TIMESHEET LOGGING: Update UserLog (Session) ---
+    if (entityName === 'Timesheet') {
+      setImmediate(async () => {
+        try {
+          const UserLog = Models.UserLog; // Ensure this is available in Models
+          const userEmail = savedItem.user_email;
+          if (userEmail && UserLog) {
+            // Find the most recent active session (logged in, not logged out)
+            // Or just the latest session for this user
+            const activeLog = await UserLog.findOne({
+              email: userEmail,
+              logout_time: { $exists: false } // Assuming null or missing field
+            }).sort({ login_time: -1 });
+
+            if (activeLog) {
+              // Determine IST Date for activity log
+              const istNow = new Date(Date.now() + (330 * 60000));
+
+              await UserLog.findByIdAndUpdate(activeLog._id, {
+                $inc: {
+                  submitted_timesheets_count: 1,
+                  pending_log_count: -1 // reduce pending count
+                },
+                $push: {
+                  timesheet_activity_log: {
+                    submission_time: istNow,
+                    timesheet_id: savedItem._id,
+                    task_id: savedItem.task_id,
+                    hours: savedItem.hours,
+                    task_title: savedItem.task_title
+                  }
+                }
+              });
+              // Ensure pending count doesn't go below 0 (though $inc logic is atomic, we can't condition it easily here, but it's fine)
+            }
+          }
+        } catch (logErr) {
+          console.error('[Timesheet] Failed to update UserLog:', logErr);
+        }
+      });
+    }
+
+    // Handle email notifications asynchronously after response is sent
+    // This ensures task creation is not affected by email failures
+    if (entityName === 'Task' && savedItem.assigned_to && savedItem.assigned_to.length > 0) {
+      // Fire and forget - don't await, run asynchronously
+      setImmediate(async () => {
+        try {
+          const emailService = require('../services/emailService');
+          const frontendUrl = process.env.FRONTEND_URL;
+          if (!frontendUrl) {
+            console.warn('FRONTEND_URL not set in environment variables');
+            return;
+          }
+
+          // Get project info
+          let projectName = 'No Project';
+          if (savedItem.project_id) {
+            const project = await Models.Project.findById(savedItem.project_id);
+            if (project) projectName = project.name;
+          }
+
+          // Get assigner info
+          const assignerEmail = req.user?.email || savedItem.reporter || 'System';
+          const assigner = await Models.User.findOne({ email: assignerEmail });
+          const assignerName = assigner?.full_name || assignerEmail;
+
+          // Get assignees
+          const assignees = Array.isArray(savedItem.assigned_to) ? savedItem.assigned_to : [savedItem.assigned_to];
+
+          // Send email to each assignee
+          for (const assigneeEmail of assignees) {
+            try {
+              const assignee = await Models.User.findOne({ email: assigneeEmail });
+              const assigneeName = assignee?.full_name || assigneeEmail;
+
+              await emailService.sendEmail({
+                to: assigneeEmail,
+                templateType: 'task_assigned',
+                data: {
+                  assigneeName,
+                  assigneeEmail,
+                  taskTitle: savedItem.title,
+                  taskDescription: savedItem.description,
+                  projectName,
+                  assignedBy: assignerName,
+                  dueDate: savedItem.due_date,
+                  priority: savedItem.priority,
+                  taskUrl: savedItem.project_id
+                    ? `${frontendUrl}/projects/${savedItem.project_id}/tasks/${savedItem._id}`
+                    : `${frontendUrl}/tasks/${savedItem._id}`
+                }
+              });
+            } catch (error) {
+              console.error(`Failed to send task assignment email to ${assigneeEmail}:`, error);
+            }
+          }
+        } catch (error) {
+          console.error('Failed to send task creation emails:', error);
+          // Email failure does not affect task creation
+        }
+      });
+    }
+
+    // --- IMPEDIMENT NOTIFICATIONS ---
+    if (entityName === 'Impediment') {
+      console.log('[API] Impediment created. Starting notification logic...');
+      setImmediate(async () => {
+        try {
+          const Notification = Models.Notification;
+          const Project = Models.Project;
+          const User = Models.User;
+          const Task = Models.Task;
+          const ProjectUserRole = Models.ProjectUserRole;
+
+          console.log(`[API] Fetching details for Project: ${savedItem.project_id}, Task: ${savedItem.task_id}`);
+
+          // 1. Get Details
+          const project = await Project.findById(savedItem.project_id);
+          const task = await Task.findById(savedItem.task_id);
+          const reporter = await User.findOne({ email: savedItem.reported_by });
+
+          if (!project || !task) {
+            console.log('[API] Project or Task not found for notification.');
+            return;
+          }
+
+          const reporterName = reporter?.full_name || savedItem.reported_by_name || savedItem.reported_by;
+          const taskTitle = task.title;
+          const projectName = project.name;
+          const projectId = project._id;
+          const sprintId = savedItem.sprint_id;
+
+          // Construct Deep Link to Sprint Blockers
+          // Correct Frontend Route: /SprintPlanningPage?sprintId=...&projectId=...&tab=blockers
+          const deepLink = `/SprintPlanningPage?sprintId=${sprintId}&projectId=${projectId}&tab=blockers`;
+
+          // 2. Identify Recipients
+          const recipients = new Set();
+          const userIdsToCheck = new Set();
+          const emailsToCheck = new Set();
+
+          // A. Owner
+          if (project.owner) {
+            if (project.owner.includes('@')) {
+              recipients.add(project.owner);
+              emailsToCheck.add(project.owner);
+            } else {
+              userIdsToCheck.add(project.owner);
+            }
+          }
+
+          // B. Team Members (Array of objects/IDs)
+          if (project.team_members && Array.isArray(project.team_members)) {
+            project.team_members.forEach(m => {
+              if (typeof m === 'object') {
+                if (m.user_id) userIdsToCheck.add(m.user_id);
+                if (m.email) {
+                  emailsToCheck.add(m.email);
+                  if (m.role === 'project_manager') recipients.add(m.email);
+                }
+              } else if (typeof m === 'string') {
+                userIdsToCheck.add(m);
+              }
+            });
+          }
+
+          // C. ProjectUserRole (Custom Roles)
+          const pmRoles = await ProjectUserRole.find({ project_id: projectId });
+          pmRoles.forEach(r => {
+            if (r.user_id) userIdsToCheck.add(r.user_id);
+          });
+
+          // D. Resolve Users and Check Roles
+          if (userIdsToCheck.size > 0 || emailsToCheck.size > 0) {
+            const users = await User.find({
+              $or: [
+                { _id: { $in: Array.from(userIdsToCheck) } },
+                { email: { $in: Array.from(emailsToCheck) } }
+              ]
+            });
+
+            users.forEach(u => {
+              let isManager = false;
+
+              // 1. Is Owner?
+              if (project.owner === u.id || project.owner === u._id.toString() || project.owner === u.email) isManager = true;
+
+              // 2. Has Global PM Role?
+              if (u.role === 'project_manager' || u.custom_role === 'project_manager') isManager = true;
+
+              // 3. Has Explicit Project Role?
+              if (project.team_members && Array.isArray(project.team_members)) {
+                const memberRec = project.team_members.find(m =>
+                  m.user_id === u.id || m.user_id === u._id.toString() || m.email === u.email
+                );
+                if (memberRec && memberRec.role === 'project_manager') isManager = true;
+              }
+              // Check ProjectUserRole
+              const userPmRole = pmRoles.find(r => r.user_id === u.id || r.user_id === u._id.toString());
+              if (userPmRole && userPmRole.role === 'project_manager') isManager = true;
+
+              if (isManager && u.email) {
+                recipients.add(u.email);
+              }
+            });
+          }
+
+          recipients.delete(savedItem.reported_by);
+
+          const notifications = [];
+
+          // 3. Create Notifications for Manager/Owner
+          const createdDate = new Date();
+
+          console.log('[API] Using type: impediment_alert, category: alert');
+
+
+          recipients.forEach(email => {
+            notifications.push({
+              tenant_id: savedItem.tenant_id,
+              recipient_email: email,
+              type: 'impediment_reported', // General notification for managers too
+              category: 'general',
+              title: 'New Impediment Reported',
+              message: `${reporterName} reported an impediment on task "${taskTitle}".`,
+              entity_type: 'impediment',
+              entity_id: savedItem._id,
+              project_id: projectId,
+              deep_link: deepLink,
+              sender_name: reporterName,
+              read: false,
+              created_date: createdDate
+            });
+          });
+
+          // 4. Create Confirmation Notification for Reporter (Viewer/User)
+          notifications.push({
+            tenant_id: savedItem.tenant_id,
+            recipient_email: savedItem.reported_by,
+            type: 'impediment_reported', // Changed to avoid _alert suffix logic
+            category: 'general',
+            title: 'Impediment Reported',
+            message: `You successfully reported an impediment for task "${taskTitle}".`,
+            entity_type: 'impediment',
+            entity_id: savedItem._id,
+            project_id: projectId,
+            // deep_link: deepLink, // Removed for reporter as per request
+            sender_name: 'System',
+            read: false,
+            created_date: createdDate
+          });
+
+          console.log(`[API] Inserting ${notifications.length} notifications.`);
+
+          if (notifications.length > 0) {
+            const inserted = await Notification.insertMany(notifications);
+            console.log(`[API] Inserted IDs:`, inserted.map(i => i._id));
+            // Emit to socket if available?
+            // Since 'req.io' is available in route, but we are in setImmediate... 
+            // setImmediate generic callback might not capture req.io if not passed.
+            // Usually req.io is available in the closure if we define it inside.
+            // Yes, 'req' is in scope.
+            if (req.io) {
+              console.log('[API] Emitting via Socket.IO');
+              notifications.forEach(n => {
+                req.io.to(n.tenant_id).emit('new_notification', n);
+              });
+            } else {
+              console.log('[API] req.io not available');
+            }
+          }
+
+        } catch (err) {
+          console.error('[Impediment] Notification Error:', err);
+        }
+      });
+    }
+
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+router.post('/entities/:entity/update', async (req, res) => {
+  try {
+    const Model = Models[req.params.entity];
+    const entityName = req.params.entity;
+    const { id, data } = req.body;
+
+    // --- ASSIGNMENT FREEZE VALIDATION ---
+    if (entityName === 'Task' && data && data.assigned_to) {
+      let assignees = [];
+      if (Array.isArray(data.assigned_to)) {
+        assignees = data.assigned_to;
+      } else if (typeof data.assigned_to === 'string') {
+        assignees = data.assigned_to.split(',').map(s => s.trim()).filter(Boolean);
+      }
+
+      if (assignees.length > 0) {
+        const Notification = Models.Notification;
+        const frozenUsers = [];
+        for (const email of assignees) {
+          if (!email) continue;
+          // Check for active high rework alarm (OPEN or APPEALED)
+          const alarm = await Notification.findOne({
+            recipient_email: email,
+            type: 'high_rework_alarm',
+            status: { $in: ['OPEN', 'APPEALED'] }
+          });
+          if (alarm) frozenUsers.push(email);
+        }
+
+        if (frozenUsers.length > 0) {
+          return res.status(400).json({
+            error: `Cannot assign task: User has too many rework tasks.`
+          });
+        }
+      }
+    }
+
+    console.log(`[API] Update Request for ${entityName} ID: ${id}`);
+    if (!Model) {
+      console.error(`[API] Model ${entityName} not found in Models.`);
+      return res.status(400).json({ error: `Model ${entityName} not supported` });
+    }
+
+    // Get old document before update
+    const oldDoc = await Model.findById(id);
+    if (!oldDoc) {
+      console.error(`[API] Entity ${entityName} with ID ${id} NOT FOUND.`);
+      return res.status(404).json({ error: 'Entity not found' });
+    }
+
+
+    // --- TIMESHEET VALIDATION: OVERWORK LOCK ---
+    if (entityName === 'Timesheet') {
+      // Check if modifying work_type to overtime OR if it's already overtime (though update might not change type)
+      // If the user tries to SET it to overtime, check flag.
+      if (data.work_type === 'overtime') {
+        // We need to check the user. If user_email is in data, use it. If not, use oldDoc.
+        const userEmail = data.user_email || oldDoc.user_email;
+        if (userEmail) {
+          const user = await Models.User.findOne({ email: userEmail });
+          if (user && user.is_overloaded) {
+            return res.status(400).json({
+              error: 'Overtime is disabled because you have exceeded the work limit (>11h for 5 consecutive days). Please contact your Project Manager.'
+            });
+          }
+        }
+      }
+    }
+
+    // --- TIMESHEET SPECIAL LOGIC: UPDATE SNAPSHOT ---
+    if (entityName === 'Timesheet') {
+      try {
+        // If status changes to 'submitted' OR hours changed OR it's just a general update, recalibrate cost.
+        // We ALWAYS fetch the latest user rate to keep it fresh until it's 'approved'.
+        // IF the timesheet is already approved, maybe we shouldn't change it?
+        // For now, per requirement "create a timesheet snapshot at the time of submit", we update it here.
+        if (oldDoc.status !== 'approved') {
+          const userEmail = data.user_email || oldDoc.user_email;
+          if (userEmail) {
+            const user = await Models.User.findOne({ email: userEmail });
+            if (user && user.hourly_rate) {
+              data.snapshot_hourly_rate = user.hourly_rate;
+
+              // Use new hours if provided, else old hours
+              const relevantTotalMinutes = data.total_minutes !== undefined ? data.total_minutes : oldDoc.total_minutes;
+
+              if (relevantTotalMinutes) {
+                data.snapshot_total_cost = user.hourly_rate * (relevantTotalMinutes / 60);
+              } else {
+                // Fallback if total_minutes is missing in oldDoc (legacy)
+                const h = data.hours !== undefined ? data.hours : oldDoc.hours;
+                const m = data.minutes !== undefined ? data.minutes : oldDoc.minutes;
+                const total = (h || 0) * 60 + (m || 0);
+                if (total > 0) data.snapshot_total_cost = user.hourly_rate * (total / 60);
+              }
+            }
+          }
+        }
+      } catch (tsError) {
+        console.error("Error updating Timesheet snapshot:", tsError);
+      }
+    }
+
+    // Perform update
+    const updatedDoc = await Model.findByIdAndUpdate(id, data, { new: true });
+
+    // Send response immediately after update
+    res.json(updatedDoc);
+
+    // --- ACTIVITY LOGGING ---
+    setImmediate(async () => {
+      try {
+        const { logUserMetrics } = require('../utils/userMetricsLogger');
+
+        // 1. Timesheet Updated -> Log for User (e.g. status change)
+        if (entityName === 'Timesheet') {
+          await logUserMetrics(updatedDoc.user_email, 'timesheet_submission');
+        }
+
+        // 2. Task Updated -> Log for NEW Assignees
+        if (entityName === 'Task' && data.assigned_to) {
+          const newAssignees = Array.isArray(updatedDoc.assigned_to) ? updatedDoc.assigned_to : [updatedDoc.assigned_to];
+          // Log for everyone currently assigned
+          for (const email of newAssignees) {
+            await logUserMetrics(email, 'task_assignment');
+          }
+        }
+      } catch (err) {
+        console.error("Activity Logging Error (Update):", err);
+      }
+    });
+
+    // Handle email notifications asynchronously after response is sent
+    // This ensures team member add/remove operations are not affected by email failures
+    if (entityName === 'Project' && data.team_members) {
+      // Fire and forget - don't await, run asynchronously
+      setImmediate(async () => {
+        try {
+          const { handleTeamMemberRemoval } = require('../utils/teamMemberRemovalHelper');
+          const emailService = require('../services/emailService');
+          const frontendUrl = process.env.FRONTEND_URL;
+          if (!frontendUrl) {
+            console.warn('FRONTEND_URL not set in environment variables');
+            return;
+          }
+
+          // Detect added and removed members
+          const oldMembers = (oldDoc.team_members || []).map(m => {
+            const email = typeof m === 'string' ? m : m.email;
+            return email?.toLowerCase();
+          }).filter(Boolean);
+
+          const newMembers = (updatedDoc.team_members || []).map(m => {
+            const email = typeof m === 'string' ? m : m.email;
+            return email?.toLowerCase();
+          }).filter(Boolean);
+
+          const addedMembers = newMembers.filter(email => !oldMembers.includes(email));
+          const removedMembers = oldMembers.filter(email => !newMembers.includes(email));
+
+          // Get updater info (from request if available, otherwise use project owner)
+          const updaterEmail = req.user?.email || oldDoc.owner || 'System';
+          const updater = await Models.User.findOne({ email: updaterEmail });
+          const updaterName = updater?.full_name || updaterEmail;
+
+          // Send emails to added members
+          for (const memberEmail of addedMembers) {
+            try {
+              const member = await Models.User.findOne({ email: memberEmail });
+              const memberName = member?.full_name || memberEmail;
+
+              await emailService.sendEmail({
+                to: memberEmail,
+                templateType: 'project_member_added',
+                data: {
+                  memberName,
+                  memberEmail,
+                  projectName: updatedDoc.name,
+                  projectDescription: updatedDoc.description,
+                  addedBy: updaterName,
+                  projectUrl: `${frontendUrl}/projects/${updatedDoc._id}`
+                }
+              });
+            } catch (error) {
+              console.error(`Failed to send email to ${memberEmail}:`, error);
+            }
+          }
+
+          // Send emails to removed members
+          for (const memberEmail of removedMembers) {
+            try {
+              const member = await Models.User.findOne({ email: memberEmail });
+              const memberName = member?.full_name || memberEmail;
+
+              await emailService.sendEmail({
+                to: memberEmail,
+                templateType: 'team_member_removed',
+                data: {
+                  memberName,
+                  memberEmail,
+                  projectName: updatedDoc.name,
+                  removedBy: updaterName,
+                  reason: null
+                }
+              });
+            } catch (error) {
+              console.error(`Failed to send removal email to ${memberEmail}:`, error);
+            }
+          }
+        } catch (error) {
+          console.error('Failed to send project team member emails:', error);
+          // Email failure does not affect team member operations
+        }
+      });
+    }
+
+    // Handle email notifications for leave status changes asynchronously after response is sent
+    // This ensures leave status updates are not affected by email failures
+    if (entityName === 'Leave' && data.status && oldDoc.status !== data.status) {
+      // Fire and forget - don't await, run asynchronously
+      setImmediate(async () => {
+        try {
+          const emailService = require('../services/emailService');
+
+          const newStatus = data.status;
+          const oldStatus = oldDoc.status;
+
+          // Send emails for status changes:
+          // 1. submitted -> approved/rejected/cancelled
+          // 2. approved -> cancelled (user cancelling approved leave)
+          const shouldSendEmail = (
+            ((newStatus === 'approved' || newStatus === 'rejected' || newStatus === 'cancelled') && oldStatus === 'submitted') ||
+            (newStatus === 'cancelled' && oldStatus === 'approved')
+          );
+
+          if (shouldSendEmail) {
+            const user = await Models.User.findById(updatedDoc.user_id);
+            const approverEmail = data.approved_by || updatedDoc.approved_by || 'Administrator';
+            const approver = await Models.User.findOne({ email: approverEmail });
+            const approverName = approver?.full_name || approverEmail;
+            const leaveType = await Models.LeaveType.findById(updatedDoc.leave_type_id);
+
+            // Try to get comment from LeaveApproval if it exists
+            let description = data.rejection_reason || updatedDoc.rejection_reason;
+            if (!description && (newStatus === 'approved' || newStatus === 'rejected')) {
+              const approval = await Models.LeaveApproval.findOne({
+                leave_id: updatedDoc._id.toString()
+              }).sort({ acted_at: -1 });
+              if (approval && approval.comment) {
+                description = approval.comment;
+              }
+            }
+
+            if (!description) {
+              description = newStatus === 'approved' ? 'Your leave has been approved.' :
+                (newStatus === 'rejected' ? 'No reason provided' : 'No reason provided');
+            }
+
+            const templateType = newStatus === 'approved' ? 'leave_approved' : 'leave_cancelled';
+
+            await emailService.sendEmail({
+              to: updatedDoc.user_email || user?.email,
+              templateType,
+              data: {
+                memberName: updatedDoc.user_name || user?.full_name || updatedDoc.user_email,
+                memberEmail: updatedDoc.user_email || user?.email,
+                leaveType: updatedDoc.leave_type_name || leaveType?.name || 'Leave',
+                startDate: updatedDoc.start_date,
+                endDate: updatedDoc.end_date,
+                duration: updatedDoc.duration,
+                totalDays: updatedDoc.total_days,
+                approvedBy: newStatus === 'approved' ? approverName : undefined,
+                cancelledBy: (newStatus === 'cancelled' || newStatus === 'rejected') ? approverName : undefined,
+                reason: (newStatus === 'cancelled' || newStatus === 'rejected') ? description : undefined,
+                description: description
+              }
+            });
+          }
+        } catch (error) {
+          console.error('Failed to send leave status email:', error);
+          // Email failure does not affect leave status updates
+        }
+      });
+    }
+
+    // Handle email notifications for task assignments asynchronously after response is sent
+    // This ensures task assignment updates are not affected by email failures
+    if (entityName === 'Task' && data.assigned_to) {
+      // Fire and forget - don't await, run asynchronously
+      setImmediate(async () => {
+        try {
+          const emailService = require('../services/emailService');
+          const frontendUrl = process.env.FRONTEND_URL;
+          if (!frontendUrl) {
+            console.warn('FRONTEND_URL not set in environment variables');
+            return;
+          }
+
+          const oldAssignees = Array.isArray(oldDoc.assigned_to) ? oldDoc.assigned_to : (oldDoc.assigned_to ? [oldDoc.assigned_to] : []);
+          const newAssignees = Array.isArray(updatedDoc.assigned_to) ? updatedDoc.assigned_to : (updatedDoc.assigned_to ? [updatedDoc.assigned_to] : []);
+
+          // Find newly assigned members (not in old list)
+          const newlyAssigned = newAssignees.filter(email => !oldAssignees.includes(email));
+
+          if (newlyAssigned.length > 0) {
+            // Get project info
+            let projectName = 'No Project';
+            if (updatedDoc.project_id) {
+              const project = await Models.Project.findById(updatedDoc.project_id);
+              if (project) projectName = project.name;
+            }
+
+            // Get assigner info
+            const assignerEmail = req.user?.email || updatedDoc.reporter || 'System';
+            const assigner = await Models.User.findOne({ email: assignerEmail });
+            const assignerName = assigner?.full_name || assignerEmail;
+
+            // Send email to each newly assigned member
+            for (const assigneeEmail of newlyAssigned) {
+              try {
+                const assignee = await Models.User.findOne({ email: assigneeEmail });
+                const assigneeName = assignee?.full_name || assigneeEmail;
+
+                await emailService.sendEmail({
+                  to: assigneeEmail,
+                  templateType: 'task_assigned',
+                  data: {
+                    assigneeName,
+                    assigneeEmail,
+                    taskTitle: updatedDoc.title,
+                    taskDescription: updatedDoc.description,
+                    projectName,
+                    assignedBy: assignerName,
+                    dueDate: updatedDoc.due_date,
+                    priority: updatedDoc.priority,
+                    taskUrl: updatedDoc.project_id
+                      ? `${frontendUrl}/projects/${updatedDoc.project_id}/tasks/${updatedDoc._id}`
+                      : `${frontendUrl}/tasks/${updatedDoc._id}`
+                  }
+                });
+              } catch (error) {
+                console.error(`Failed to send task assignment email to ${assigneeEmail}:`, error);
+              }
+            }
+          }
+        } catch (error) {
+          console.error('Failed to send task assignment emails:', error);
+          // Email failure does not affect task assignment updates
+        }
+      });
+    }
+  } catch (err) {
+    res.status(500).send(err.message);
+  }
+});
+router.post('/entities/:entity/delete', async (req, res) => {
+  try {
+    const { entity } = req.params;
+    const { id } = req.body;
+
+    // 1. Perform cascade deletion first
+    await handleCascadeDelete(entity, id);
+
+    // 2. Delete the entity itself
+    const Model = Models[entity];
+    await Model.findByIdAndDelete(id);
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).send(err.message);
+  }
+});
+
+// ... (AI HELPER ROUTES) ...
+router.get('/ai/conversations', async (req, res) => { const { user_id, tenant_id } = req.query; if (!user_id || !tenant_id) return res.json([]); try { const conversations = await Models.Conversation.find({ user_id, tenant_id, is_active: true }).sort({ updated_date: -1 }).limit(20); res.json(conversations); } catch (err) { res.status(500).json({ error: err.message }); } });
+router.post('/ai/conversations', async (req, res) => { try { const convo = new Models.Conversation({ ...req.body, messages: [] }); await convo.save(); res.json(convo); } catch (err) { res.status(500).json({ error: err.message }); } });
+router.get('/ai/usage/stats', async (req, res) => { const { user_id, tenant_id } = req.query; try { const usage = await Models.TokenUsage.aggregate([{ $match: { user_id, tenant_id } }, { $group: { _id: null, total_tokens: { $sum: "$total_tokens" } } }]); res.json(usage[0] || { total_tokens: 0 }); } catch (err) { res.status(500).json({ error: err.message }); } });
+
+// === CHAT ROUTE ===
+router.post('/ai/chat', async (req, res) => {
+  const { conversation_id, content, file_urls, context, model, user_id, tenant_id } = req.body;
+  if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: "AI Configuration Error" });
+
+  try {
+    const conversation = await Models.Conversation.findById(conversation_id);
+    if (!conversation) return res.status(404).json({ error: "Conversation not found" });
+
+    const userMsg = { role: 'user', content: content, file_urls, created_at: new Date() };
+    conversation.messages.push(userMsg);
+    conversation.updated_date = new Date();
+    await conversation.save();
+
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+    const deepContext = await buildDeepContext(tenant_id, user_id, content);
+    const fileParts = await processFilesForGemini(file_urls, req);
+
+    let contextBlock = "";
+    if (context) contextBlock += `${context}\n`;
+    if (deepContext) contextBlock += `${deepContext}\n`;
+
+    const finalParts = [
+      ...fileParts,
+      { text: contextBlock ? `SYSTEM DATA:\n${contextBlock}\n\nUSER QUERY: ${content}` : content }
+    ];
+
+    const systemInstruction = {
+      parts: [{ text: `You are Aivora. Concise, helpful, professional.` }]
+    };
+
+    const result = await generateController(genAI, {
+      content: finalParts,
+      history: conversation.messages.slice(-6).map(m => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content || (m.file_urls?.length ? "File" : "") }]
+      })),
+      systemInstruction: systemInstruction
+    }, model);
+
+    conversation.messages.push({ role: 'assistant', content: result.text, created_at: new Date() });
+    await conversation.save();
+
+    if (result.usage?.totalTokenCount > 0) {
+      await Models.TokenUsage.create({
+        tenant_id, user_id, model: result.model,
+        total_tokens: result.usage.totalTokenCount,
+        created_date: new Date()
+      });
+    }
+
+    res.json({ message: result.text, usage: result.usage, model: result.model });
+
+  } catch (err) {
+    console.error("AI Chat Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === UPDATED SPRINT TASK GEN ROUTE (JSON FALLBACK HANDLING) ===
+router.post('/ai/generate-sprint-tasks', async (req, res) => {
+  const { sprintId, projectId, workspaceId, tenantId, goal, userEmail } = req.body;
+  if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: "AI Configuration Error" });
+
+  try {
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const prompt = `Create tasks. Goal: "${goal}". Return JSON { "tasks": [] }.`;
+
+    // Use default model (gemini-2.5-flash-native-audio-dialog) from helper
+    const result = await generateController(genAI, {
+      content: prompt,
+      generationConfig: { responseMimeType: "application/json" }
+    }, modelHelper.getDefaultModel());
+
+    // [MODIFICATION] Robust JSON Parsing (Strips Markdown fences if JSON mode failed/was disabled)
+    const jsonMatch = result.text.match(/\{[\s\S]*\}/);
+    const jsonStr = jsonMatch ? jsonMatch[0] : result.text;
+
+    let aiData;
+    try {
+      aiData = JSON.parse(jsonStr);
+    } catch (e) {
+      console.error("JSON Parse Failed:", result.text);
+      return res.json({ message: "Failed to parse AI response", tasks: [] });
+    }
+
+    const tasksToCreate = (aiData.tasks || []).map(t => ({ ...t, tenant_id: tenantId, project_id: projectId, workspace_id: workspaceId, sprint_id: sprintId, status: 'todo', ai_generated: true, reporter: userEmail }));
+    if (tasksToCreate.length > 0) {
+      const createdTasks = await Models.Task.insertMany(tasksToCreate);
+      return res.json({ success: true, tasks: createdTasks });
+    }
+    res.json({ message: "No tasks generated", tasks: [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === UPDATED INTEGRATIONS LLM ROUTE (Fixes "Failed to draft" and JSON Parse Errors) ===
+router.post('/integrations/llm', async (req, res) => {
+  const { prompt, response_json_schema, context, file_urls } = req.body;
+
+  // 1. Handle Missing API Key Gracefully
+  if (!process.env.GEMINI_API_KEY) {
+    console.warn("[AI] No API Key found. Returning mock response.");
+    if (response_json_schema) {
+      return res.json({
+        description: "This is a drafted description generated by the system (Mock Mode). Please configure your GEMINI_API_KEY to get real AI suggestions.",
+        priority: "medium",
+        story_points: 3,
+        reasoning: "Mock reasoning (API Key missing)",
+        confidence: 90,
+        tags: ["mock", "tag"],
+        dependency_ids: []
+      });
+    }
+    return res.json("AI Response (Mock): Please configure API Key.");
+  }
+
+  try {
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const generationConfig = response_json_schema ? { responseMimeType: "application/json" } : {};
+
+    const fileParts = await processFilesForGemini(file_urls, req);
+
+    // 2. Handle undefined context safely
+    let textPart = `USER QUERY: ${prompt}`;
+    if (context && typeof context === 'string' && context.trim()) {
+      textPart = `CONTEXT:\n${context}\n\n${textPart}`;
+    }
+
+    const parts = [...fileParts, { text: textPart }];
+
+    // Use default model (gemini-2.5-flash-native-audio-dialog) from helper
+    // This provides unlimited RPD/RPM to avoid quota issues
+    const result = await generateController(genAI, {
+      content: parts,
+      generationConfig: generationConfig
+    }, modelHelper.getDefaultModel());
+
+    const text = result.text;
+
+    if (response_json_schema) {
+      // 3. Robust JSON Parsing & Fallback for Plain Text
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      const jsonStr = jsonMatch ? jsonMatch[0] : text;
+
+      try {
+        const jsonObj = JSON.parse(jsonStr);
+        return res.json(jsonObj);
+      } catch (e) {
+        // *** THE FIX: Auto-Correct Plain Text Responses ***
+        console.warn("[AI] JSON Parse Failed. attempting text fallback.");
+
+        // If the user requested a description and we got text, assume the text IS the description
+        if (response_json_schema?.properties?.description) {
+          return res.json({
+            description: text.replace(/[*#]/g, ''), // Strip markdown artifacts
+            priority: "medium",
+            story_points: 1
+          });
+        }
+
+        console.error("[AI] JSON Parse Failed (Unrecoverable):", text);
+        return res.status(500).json({ error: "Failed to parse generated JSON", raw: text });
+      }
+    }
+    res.json(text);
+  } catch (err) {
+    console.error("[AI] Endpoint Error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// === EMAIL ROUTE USING RESEND SDK ===
+router.post('/integrations/email', async (req, res) => {
+  const { to, subject, body } = req.body;
+  if (!process.env.RESEND_API_KEY) return res.status(500).json({ error: "Email config missing: RESEND_API_KEY not set" });
+
+  try {
+    const { Resend } = require('resend');
+    const resend = new Resend(process.env.RESEND_API_KEY);
+
+    const from = process.env.MAIL_FROM || 'Groona <no-reply@quantumisecode.com>';
+
+    await resend.emails.send({
+      from: from,
+      to: Array.isArray(to) ? to : [to],
+      subject: subject,
+      html: body
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[API] Email send error:', err);
+    res.status(500).json({ error: err.message || 'Failed to send email. Please check Resend API configuration.' });
+  }
+});
+
+// Email with template endpoint
+router.post('/email/send-template', async (req, res) => {
+  const { to, templateType, data, subject } = req.body;
+
+  if (!to || !templateType) {
+    return res.status(400).json({ error: 'Missing required fields: to, templateType' });
+  }
+
+  try {
+    await emailService.sendEmail({
+      to,
+      templateType,
+      data,
+      subject
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[API] Email template send error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+module.exports = router;
